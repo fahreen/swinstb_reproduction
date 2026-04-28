@@ -1,0 +1,117 @@
+# 3D-SwinSTB Reproduction — Default Configuration
+# All hyperparameters from Pan et al. (2025), Section VI-A.
+
+# ─────────────────────────────────────────────────────────────
+# Paths (adjust for local vs Colab)
+# ─────────────────────────────────────────────────────────────
+paths:
+  # Local — pointing at existing SpectraScope dataset
+  raw_fm_dir: "C:/Users/fahre/Documents/spectrascope/data/FM-Spectrum-Dataset"
+  raw_lte_dir: "C:/Users/fahre/Documents/spectrascope/data/LTE-Spectrum-Dataset"
+  raw_crossval_dir: "C:/Users/fahre/Documents/spectrascope/data/Cross-Validation-Spectrum-Dataset"
+  processed_fm: "./data/processed/fm_spectrograms.npy"
+  processed_lte: "./data/processed/lte_spectrograms.npy"
+  checkpoint_dir: "./checkpoints"
+  output_dir: "./outputs"
+
+  # Colab (uncomment when running in Colab)
+  # raw_fm_dir: "/content/drive/MyDrive/swinstb_reproduction/data/raw/fm"
+  # raw_lte_dir: "/content/drive/MyDrive/swinstb_reproduction/data/raw/lte"
+  # processed_fm: "/content/drive/MyDrive/swinstb_reproduction/data/processed/fm_spectrograms.npy"
+  # processed_lte: "/content/drive/MyDrive/swinstb_reproduction/data/processed/lte_spectrograms.npy"
+  # checkpoint_dir: "/content/drive/MyDrive/swinstb_reproduction/checkpoints"
+  # output_dir: "/content/drive/MyDrive/swinstb_reproduction/outputs"
+
+# ─────────────────────────────────────────────────────────────
+# Data preprocessing
+# ─────────────────────────────────────────────────────────────
+data:
+  fm:
+    samples_per_file: 32508        # Total I/Q samples per FM file
+    center_freq_mhz: 99.0
+  lte:
+    samples_per_file: 16254        # Total I/Q samples per LTE file
+    center_freq_mhz: 700.0
+
+  stft:
+    sampling_freq_hz: 125_000_000  # Pre-decimation sample rate
+    decimation_factor: 4           # Descending sampling coefficient
+    window_length: 256             # STFT window (= N_BINS)
+    window_type: "hann"
+    noverlap: 0                    # No overlap by default (126 time bins for FM)
+    log_compression: true          # Paper silent; standard practice
+
+  spectrogram:
+    height: 256                    # H — target spatial resolution
+    width: 256                     # W — target spatial resolution
+    colormap: "jet"                # Pan et al. use Jet (Appendix A)
+
+  sequence:
+    input_length: 20               # T — input frames
+    target_length: 20              # K — target frames
+    stride: 1                      # Sliding window stride
+
+  split:
+    ratio: [4, 1, 1]               # train:val:test
+    method: "chronological"        # Paper's choice
+
+# ─────────────────────────────────────────────────────────────
+# Model hyperparameters (Section VI-A)
+# ─────────────────────────────────────────────────────────────
+model:
+  # Base embedding dim
+  feature_size: 96                 # = C
+
+  # 3D patch partition
+  patch_size: [2, 4, 4]            # (Tp, Hp, Wp)
+
+  # 3D Swin window
+  window_size: [2, 7, 7]           # (P, M, M)
+
+  # Encoder / bottleneck / decoder block counts
+  depths: [2, 4, 2, 2]             # {2,4,2} encoder + 2 bottleneck
+  num_heads: [4, 8, 16, 16]        # Encoder + bottleneck
+
+  # MLP expansion ratio (override MONAI default of 4)
+  mlp_ratio: 2
+
+  # Input/output channels
+  in_channels: 3
+  out_channels: 3
+
+  # Spatial dimensions (3 = volumetric, time + H + W)
+  spatial_dims: 3
+
+# ─────────────────────────────────────────────────────────────
+# Training
+# ─────────────────────────────────────────────────────────────
+training:
+  batch_size: 1                    # Paper's choice (memory constraint)
+  num_epochs: 20
+  learning_rate: 0.001
+  optimizer: "adamw"
+  loss: "mse"
+
+  # Mixed precision (not in paper — added for Colab efficiency)
+  use_amp: true
+
+  # Early stopping
+  early_stopping:
+    patience: 4                    # nep
+    min_improvement: 0.0001        # ϑper = 0.01%
+
+  # Checkpointing
+  save_every_epoch: true
+  save_best_only: false            # Keep both "latest" and "best"
+
+  # Data loading
+  num_workers: 2
+  pin_memory: true
+
+# ─────────────────────────────────────────────────────────────
+# Transfer learning
+# ─────────────────────────────────────────────────────────────
+transfer:
+  source_checkpoint: "./checkpoints/swinstb_fm_best.pt"
+  learning_rate: 0.001             # Same as source training (paper Fig 10d)
+  num_epochs: 20                   # Early stopping will kick in faster

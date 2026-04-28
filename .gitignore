@@ -1,0 +1,37 @@
+# Data — never commit
+data/raw/
+data/processed/
+
+# Checkpoints — too large
+checkpoints/
+
+# Outputs
+outputs/
+*.npz
+*.npy
+*.pt
+*.pth
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
