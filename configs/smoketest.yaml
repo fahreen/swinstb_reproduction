@@ -1,0 +1,78 @@
+# 3D-SwinSTB Smoke-Test Configuration
+#
+# Used ONLY for verifying the training pipeline runs end-to-end on CPU.
+# This is not a meaningful training run — the model is too small and the
+# data too sparse to learn anything useful.
+#
+# Real training uses configs/default.yaml on Colab A100.
+#
+# Run:
+#   python scripts/make_smoketest_cache.py        # one-time, builds the cache
+#   python scripts/05_train_fm.py --config configs/smoketest.yaml --smoke-test
+
+paths:
+  raw_fm_dir:    "C:/Users/fahre/Documents/spectrascope/data/FM-Spectrum-Dataset"
+  raw_lte_dir:   "C:/Users/fahre/Documents/spectrascope/data/LTE-Spectrum-Dataset"
+  processed_fm:  "./data/processed/fm_smoketest.npy"   # 100 frames, 64x64
+  processed_lte: "./data/processed/lte_spectrograms.npy"
+  checkpoint_dir: "./checkpoints/smoketest"
+  output_dir:     "./outputs/smoketest"
+
+data:
+  fm:
+    samples_per_file: 32508
+    center_freq_mhz: 99.0
+  lte:
+    samples_per_file: 16254
+    center_freq_mhz: 700.0
+  stft:
+    sampling_freq_hz: 125_000_000
+    decimation_factor: 4
+    window_length: 256
+    window_type: "hann"
+    noverlap: 0
+    log_compression: true
+  spectrogram:
+    height: 64
+    width: 64
+    colormap: "jet"
+  sequence:
+    input_length: 4            # T = 4 (vs 20 in default)
+    target_length: 4           # K = 4
+    stride: 1
+  split:
+    ratio: [4, 1, 1]
+    method: "chronological"
+
+# Smaller model so CPU forward+backward is fast.
+# Architecture is the same shape as default; only the channel dimension shrinks.
+model:
+  feature_size: 24             # C = 24 (vs 96 in default) — ~16x fewer params
+  patch_size: [2, 4, 4]
+  window_size: [2, 4, 4]       # smaller window since patch grid is only 16x16
+  depths: [2, 2, 2, 2]         # encoder {2,2,2} + bottleneck 2
+  num_heads: [2, 4, 8, 8]      # smaller heads for the smaller channel dims
+  mlp_ratio: 2.0
+  in_channels: 3
+  out_channels: 3
+  spatial_dims: 3
+
+training:
+  batch_size: 1
+  num_epochs: 20
+  learning_rate: 0.001
+  optimizer: "adamw"
+  loss: "mse"
+  use_amp: true
+  early_stopping:
+    patience: 4
+    min_improvement: 0.0001
+  save_every_epoch: true
+  save_best_only: false
+  num_workers: 0               # no multiprocessing — easier debugging
+  pin_memory: false
+
+transfer:
+  source_checkpoint: "./checkpoints/smoketest/swinstb_fm_best.pt"
+  learning_rate: 0.001
+  num_epochs: 20
