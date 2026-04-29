@@ -7,22 +7,10 @@ per-frame arrays to .npz (for plotting) and a human-readable summary
 to .json.
 
 Usage:
-    # Evaluate best checkpoint on the test set
     python scripts/07_evaluate.py
-
-    # Evaluate a specific checkpoint
     python scripts/07_evaluate.py --checkpoint /path/to/swinstb_fm_best.pt
-
-    # Evaluate on val (sanity) or train (overfitting check)
     python scripts/07_evaluate.py --split val
-    python scripts/07_evaluate.py --split train
-
-    # Custom config (e.g. configs/colab.yaml on Colab)
     python scripts/07_evaluate.py --config configs/colab.yaml
-
-Output files (written to <output_dir> from the config):
-    eval_<split>_metrics.npz   — four (K,) numpy arrays for plotting
-    eval_<split>_summary.json  — per-frame + aggregate mean/std
 """
 
 import argparse
@@ -49,20 +37,15 @@ def main():
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--config', type=str, default='configs/default.yaml',
-                        help='Path to YAML config file')
-    parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Path to checkpoint .pt. Defaults to '
-                             '<checkpoint_dir>/swinstb_fm_best.pt')
+    parser.add_argument('--config', type=str, default='configs/default.yaml')
+    parser.add_argument('--checkpoint', type=str, default=None)
     parser.add_argument('--split', type=str, default='test',
-                        choices=['train', 'val', 'test'],
-                        help='Which dataset split to evaluate on')
+                        choices=['train', 'val', 'test'])
     args = parser.parse_args()
 
     config = load_config(args.config)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # Resolve checkpoint path
     ckpt_path = args.checkpoint or os.path.join(
         config['paths']['checkpoint_dir'], 'swinstb_fm_best.pt'
     )
@@ -76,7 +59,6 @@ def main():
     print(f'Device:     {device}')
     print()
 
-    # ─── Build model ─────────────────────────────────────────────────────────
     model_cfg = config['model']
     model = SwinSTB(
         in_channels=model_cfg['in_channels'],
@@ -95,7 +77,6 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f'Model parameters: {n_params:,}')
 
-    # ─── Load checkpoint (weights only) ──────────────────────────────────────
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f'Checkpoint not found: {ckpt_path}')
     meta = load_checkpoint(ckpt_path, model, device=str(device))
@@ -103,7 +84,6 @@ def main():
           f"(best val loss: {meta['best_val_loss']:.6f})")
     print()
 
-    # ─── Build dataset + loader ──────────────────────────────────────────────
     seq_cfg = config['data']['sequence']
     K = seq_cfg['target_length']
     dataset = SpectrogramSequenceDataset(
@@ -122,13 +102,11 @@ def main():
         pin_memory=(device.type == 'cuda'),
     )
 
-    # ─── Run evaluation ──────────────────────────────────────────────────────
     print()
     print('Running evaluation...')
     metrics = FrameMetrics(device=device)
     results = evaluate_test_set(model, loader, metrics, device, k=K)
 
-    # ─── Save and report ─────────────────────────────────────────────────────
     output_dir = config['paths']['output_dir']
     npz_path = os.path.join(output_dir, f'eval_{args.split}_metrics.npz')
     json_path = os.path.join(output_dir, f'eval_{args.split}_summary.json')

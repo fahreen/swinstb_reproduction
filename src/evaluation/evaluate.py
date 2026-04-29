@@ -1,18 +1,151 @@
 """
-Full test-set evaluation.
+Test-set evaluation: per-frame metrics for SwinSTB predictions.
 
-Computes per-frame metric curves by evaluating on the entire test set
-and averaging each metric at each frame position (1 through K=20).
+Pipeline:
+    For each test sequence (input 20 frames, target 20 frames):
+        1. Run model forward pass → predicted 20 frames.
+        2. For each of the K=20 output frames, compute MSE/PSNR/SSIM/LPIPS
+           between the predicted frame and the target frame.
+        3. Accumulate per-frame values across all test sequences.
+    Final result: four arrays of shape (K,) — one mean value per output frame.
 
-This replicates Pan et al.'s Figure 7 (frame-wise curves).
+This produces the input data for Pan et al.'s Figure 7 — metric vs. predicted
+frame index. Early frames (closer to the input) are typically easier to
+predict; later frames degrade as the model extrapolates further into the
+future.
 
-Functions:
-    evaluate_test_set(model, test_loader) -> dict
-        Returns dict with keys 'mse', 'psnr', 'ssim', 'lpips', each
-        mapping to a length-K numpy array of per-frame averages.
-    
-    save_metrics(results, output_path) -> None
-        Save to .npz for later plotting.
+Memory note:
+    We never accumulate all predictions in memory — that would be ~270 GB
+    for the full test set. Instead, we compute metrics per batch and
+    accumulate scalars only.
 """
 
-# TODO: implement
+import json
+import os
+import time
+from typing import Dict
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+
+from src.evaluation.metrics import FrameMetrics
+
+
+def evaluate_test_set(
+    model: nn.Module,
+    test_loader: DataLoader,
+    metrics: FrameMetrics,
+    device: torch.device,
+    k: int = 20,
+) -> Dict[str, np.ndarray]:
+    """
+    Run the model on the test set and accumulate per-frame metrics.
+
+    Args:
+        model: trained SwinSTB. Will be put in eval mode.
+        test_loader: DataLoader yielding (input, target) batches, both
+            with shape (B, 3, K, H, W).
+        metrics: FrameMetrics instance for the metric computations.
+        device: torch device for inference.
+        k: number of output frames per sequence (default 20).
+
+    Returns:
+        Dict with four (k,) numpy arrays — one per metric, each entry
+        is the mean over the test set for that frame index.
+    """
+    model.eval()
+    use_amp = device.type == 'cuda'
+
+    sums = {
+        'mse':   np.zeros(k, dtype=np.float64),
+        'psnr':  np.zeros(k, dtype=np.float64),
+        'ssim':  np.zeros(k, dtype=np.float64),
+        'lpips': np.zeros(k, dtype=np.float64),
+    }
+    counts = np.zeros(k, dtype=np.int64)
+    n_batches = len(test_loader)
+
+    t_start = time.time()
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs = inputs.to(device, non_blocking=use_amp)
+            targets = targets.to(device, non_blocking=use_amp)
+
+            with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu',
+                                    enabled=use_amp):
+                preds = model(inputs)
+
+            preds = preds.float()
+            targets = targets.float()
+
+            for frame_idx in range(k):
+                pred_frame = preds[:, :, frame_idx, :, :]
+                target_frame = targets[:, :, frame_idx, :, :]
+                m = metrics.compute(pred_frame, target_frame)
+                if not (np.isnan(m['psnr']) or np.isinf(m['psnr'])):
+                    sums['psnr'][frame_idx] += m['psnr']
+                counts[frame_idx] += 1
+                sums['mse'][frame_idx]   += m['mse']
+                sums['ssim'][frame_idx]  += m['ssim']
+                sums['lpips'][frame_idx] += m['lpips']
+
+            if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
+                elapsed = time.time() - t_start
+                eta = elapsed / (batch_idx + 1) * (n_batches - batch_idx - 1)
+                print(f"  batch {batch_idx+1}/{n_batches}  "
+                      f"elapsed={elapsed:.1f}s  eta={eta:.1f}s",
+                      flush=True)
+
+    results = {
+        'mse':   sums['mse']   / counts,
+        'psnr':  sums['psnr']  / counts,
+        'ssim':  sums['ssim']  / counts,
+        'lpips': sums['lpips'] / counts,
+    }
+    return results
+
+
+def save_metrics(results: Dict[str, np.ndarray],
+                 npz_path: str,
+                 json_path: str) -> None:
+    """
+    Save evaluation results to two complementary files.
+    """
+    os.makedirs(os.path.dirname(npz_path), exist_ok=True)
+    np.savez(npz_path, **results)
+
+    summary = {
+        'per_frame': {
+            metric: arr.tolist() for metric, arr in results.items()
+        },
+        'aggregate_mean': {
+            metric: float(arr.mean()) for metric, arr in results.items()
+        },
+        'aggregate_std': {
+            metric: float(arr.std()) for metric, arr in results.items()
+        },
+    }
+    with open(json_path, 'w') as f:
+        json.dump(summary, f, indent=2)
+
+
+def print_summary(results: Dict[str, np.ndarray]) -> None:
+    """Pretty-print the per-frame metrics table."""
+    k = len(next(iter(results.values())))
+    print()
+    print(f"{'Frame':<8}{'MSE':>12}{'PSNR (dB)':>12}{'SSIM':>10}{'LPIPS':>10}")
+    print('-' * 52)
+    for i in range(k):
+        print(f"{i:<8}"
+              f"{results['mse'][i]:>12.6f}"
+              f"{results['psnr'][i]:>12.4f}"
+              f"{results['ssim'][i]:>10.4f}"
+              f"{results['lpips'][i]:>10.4f}")
+    print('-' * 52)
+    print(f"{'Mean':<8}"
+          f"{results['mse'].mean():>12.6f}"
+          f"{results['psnr'].mean():>12.4f}"
+          f"{results['ssim'].mean():>10.4f}"
+          f"{results['lpips'].mean():>10.4f}")
