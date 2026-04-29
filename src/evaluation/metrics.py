@@ -1,167 +1,104 @@
 """
-Test-set evaluation: per-frame metrics for SwinSTB predictions.
+Per-frame image quality metrics for evaluating spectrogram predictions.
 
-Pipeline:
-    For each test sequence (input 20 frames, target 20 frames):
-        1. Run model forward pass → predicted 20 frames.
-        2. For each of the K=20 output frames, compute MSE/PSNR/SSIM/LPIPS
-           between the predicted frame and the target frame.
-        3. Accumulate per-frame values across all test sequences.
-    Final result: four arrays of shape (K,) — one mean value per output frame.
+Implements the four metrics Pan et al. report in Section VII (Figure 7):
+    - MSE       : raw mean squared error, lower is better
+    - PSNR      : peak signal-to-noise ratio in dB, higher is better
+    - SSIM      : structural similarity index, higher is better, range [-1, 1]
+    - LPIPS     : learned perceptual image patch similarity, lower is better
 
-This produces the input data for Pan et al.'s Figure 7 — metric vs. predicted
-frame index. Early frames (closer to the input) are typically easier to
-predict; later frames degrade as the model extrapolates further into the
-future.
+Notes on input conventions:
+    - All metrics operate on RGB images in [0, 1].
+    - PSNR and SSIM use data_range=1.0.
+    - LPIPS internally expects inputs in [-1, 1]; we map (pred*2 - 1) before
+      passing.
+    - All metrics are computed per frame, on a (B, 3, H, W) tensor.
 
-Memory note:
-    We never accumulate all predictions in memory — that would be ~270 GB
-    for the full test set. Instead, we compute metrics per batch and
-    accumulate scalars only.
+LPIPS network choice:
+    We use 'alex' (AlexNet-based) per the LPIPS library default. Pan et al.
+    don't specify which LPIPS variant they used; 'alex' is the most common
+    default in the literature.
+
+Why a class rather than bare functions:
+    LPIPS loads a pretrained network (~6 MB AlexNet weights) on first use.
+    Reloading per frame would be wasteful. The FrameMetrics class loads it
+    once at init and reuses it.
 """
 
-import json
-import os
-import time
 from typing import Dict
 
-import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-
-from src.evaluation.metrics import FrameMetrics
+import torch.nn.functional as F
 
 
-def evaluate_test_set(
-    model: nn.Module,
-    test_loader: DataLoader,
-    metrics: FrameMetrics,
-    device: torch.device,
-    k: int = 20,
-) -> Dict[str, np.ndarray]:
+class FrameMetrics:
     """
-    Run the model on the test set and accumulate per-frame metrics.
+    Compute per-frame MSE / PSNR / SSIM / LPIPS for predicted vs target images.
 
     Args:
-        model: trained SwinSTB. Will be put in eval mode.
-        test_loader: DataLoader yielding (input, target) batches, both
-            with shape (B, 3, K, H, W).
-        metrics: FrameMetrics instance for the metric computations.
-        device: torch device for inference.
-        k: number of output frames per sequence (default 20).
+        device: torch device for the metrics' internal state (LPIPS network).
 
-    Returns:
-        Dict with four (k,) numpy arrays — one per metric, each entry
-        is the mean over the test set for that frame index.
+    Usage:
+        metrics = FrameMetrics(device='cuda')
+        result = metrics.compute(pred, target)  # returns dict of 4 floats
+
+    Both `pred` and `target` should be (B, 3, H, W) float tensors in [0, 1].
     """
-    model.eval()
-    use_amp = device.type == 'cuda'
 
-    # Accumulators: sum of per-frame metric values across batches,
-    # plus a count of batches per frame index.
-    sums = {
-        'mse':   np.zeros(k, dtype=np.float64),
-        'psnr':  np.zeros(k, dtype=np.float64),
-        'ssim':  np.zeros(k, dtype=np.float64),
-        'lpips': np.zeros(k, dtype=np.float64),
-    }
-    counts = np.zeros(k, dtype=np.int64)
-    n_batches = len(test_loader)
+    def __init__(self, device: torch.device):
+        self.device = device
 
-    t_start = time.time()
-    with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(test_loader):
-            inputs = inputs.to(device, non_blocking=use_amp)
-            targets = targets.to(device, non_blocking=use_amp)
+        from torchmetrics.image import (
+            PeakSignalNoiseRatio,
+            StructuralSimilarityIndexMeasure,
+        )
+        import lpips
 
-            with torch.amp.autocast(device_type='cuda' if use_amp else 'cpu',
-                                    enabled=use_amp):
-                preds = model(inputs)
+        self.psnr = PeakSignalNoiseRatio(data_range=1.0).to(device)
+        self.ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(device)
+        self.lpips = lpips.LPIPS(net='alex', verbose=False).to(device)
+        self.lpips.eval()
+        for p in self.lpips.parameters():
+            p.requires_grad_(False)
 
-            # preds, targets: (B, 3, K, H, W). For each frame index k,
-            # extract (B, 3, H, W) slices and compute metrics.
-            preds = preds.float()      # cast back to fp32 for metrics
-            targets = targets.float()
+    def compute(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, float]:
+        """
+        Compute the four metrics for a batch of frames.
 
-            for frame_idx in range(k):
-                pred_frame = preds[:, :, frame_idx, :, :]
-                target_frame = targets[:, :, frame_idx, :, :]
-                m = metrics.compute(pred_frame, target_frame)
-                # PSNR may be +inf if a batch is identical (unlikely but
-                # possible for trivial frames); skip those to avoid
-                # poisoning the average.
-                if not (np.isnan(m['psnr']) or np.isinf(m['psnr'])):
-                    sums['psnr'][frame_idx] += m['psnr']
-                    counts[frame_idx] += 1
-                else:
-                    counts[frame_idx] += 1  # still count for non-PSNR metrics
-                sums['mse'][frame_idx]   += m['mse']
-                sums['ssim'][frame_idx]  += m['ssim']
-                sums['lpips'][frame_idx] += m['lpips']
+        Args:
+            pred:   (B, 3, H, W) predicted RGB frames in [0, 1].
+            target: (B, 3, H, W) ground-truth RGB frames in [0, 1].
 
-            if (batch_idx + 1) % 50 == 0 or batch_idx == 0:
-                elapsed = time.time() - t_start
-                eta = elapsed / (batch_idx + 1) * (n_batches - batch_idx - 1)
-                print(f"  batch {batch_idx+1}/{n_batches}  "
-                      f"elapsed={elapsed:.1f}s  eta={eta:.1f}s",
-                      flush=True)
+        Returns:
+            Dict with keys 'mse', 'psnr', 'ssim', 'lpips' — each a Python float.
+        """
+        if pred.shape != target.shape:
+            raise ValueError(
+                f"Shape mismatch: pred {tuple(pred.shape)} vs target {tuple(target.shape)}"
+            )
+        if pred.dim() != 4 or pred.shape[1] != 3:
+            raise ValueError(
+                f"Expected (B, 3, H, W) tensors; got pred.shape={tuple(pred.shape)}"
+            )
 
-    # Mean across all test batches per frame index.
-    results = {
-        'mse':   sums['mse']   / counts,
-        'psnr':  sums['psnr']  / counts,
-        'ssim':  sums['ssim']  / counts,
-        'lpips': sums['lpips'] / counts,
-    }
-    return results
+        pred = pred.clamp(0.0, 1.0)
+        target = target.clamp(0.0, 1.0)
 
+        mse_val = F.mse_loss(pred, target).item()
 
-def save_metrics(results: Dict[str, np.ndarray],
-                 npz_path: str,
-                 json_path: str) -> None:
-    """
-    Save evaluation results to two complementary files.
+        self.psnr.reset()
+        self.ssim.reset()
+        psnr_val = self.psnr(pred, target).item()
+        ssim_val = self.ssim(pred, target).item()
 
-    Args:
-        results: dict from evaluate_test_set — four (K,) numpy arrays.
-        npz_path: where to save the raw per-frame arrays (for plotting later).
-        json_path: where to save a human-readable summary (per-frame +
-            aggregate mean across all frames).
-    """
-    os.makedirs(os.path.dirname(npz_path), exist_ok=True)
-    np.savez(npz_path, **results)
+        lpips_in_pred = pred * 2.0 - 1.0
+        lpips_in_target = target * 2.0 - 1.0
+        lpips_val = self.lpips(lpips_in_pred, lpips_in_target).mean().item()
 
-    summary = {
-        'per_frame': {
-            metric: arr.tolist() for metric, arr in results.items()
-        },
-        'aggregate_mean': {
-            metric: float(arr.mean()) for metric, arr in results.items()
-        },
-        'aggregate_std': {
-            metric: float(arr.std()) for metric, arr in results.items()
-        },
-    }
-    with open(json_path, 'w') as f:
-        json.dump(summary, f, indent=2)
-
-
-def print_summary(results: Dict[str, np.ndarray]) -> None:
-    """Pretty-print the per-frame metrics table."""
-    k = len(next(iter(results.values())))
-    print()
-    print(f"{'Frame':<8}{'MSE':>12}{'PSNR (dB)':>12}{'SSIM':>10}{'LPIPS':>10}")
-    print('-' * 52)
-    for i in range(k):
-        print(f"{i:<8}"
-              f"{results['mse'][i]:>12.6f}"
-              f"{results['psnr'][i]:>12.4f}"
-              f"{results['ssim'][i]:>10.4f}"
-              f"{results['lpips'][i]:>10.4f}")
-    print('-' * 52)
-    print(f"{'Mean':<8}"
-          f"{results['mse'].mean():>12.6f}"
-          f"{results['psnr'].mean():>12.4f}"
-          f"{results['ssim'].mean():>10.4f}"
-          f"{results['lpips'].mean():>10.4f}")
+        return {
+            'mse': mse_val,
+            'psnr': psnr_val,
+            'ssim': ssim_val,
+            'lpips': lpips_val,
+        }
