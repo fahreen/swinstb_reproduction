@@ -1,4 +1,15 @@
 """
+ read the raw radio recordings off disk and turn each one into a numpy array of complex numbers
+
+
+ After calling parse_iq_file(some_xls_path), you get back a 1D numpy array like this:
+
+ 
+ [ 142+87j, 156+92j, 134+78j, ..., -89-65j ]   # shape (32508,), dtype complex128
+
+
+
+
 Parse raw .xls files from the NUAA FM/LTE dataset.
 
 Despite the .xls extension, these are plain-text files with tab-separated values
@@ -28,21 +39,38 @@ import re
 from typing import Optional
 
 import numpy as np
+# NumPy is the foundation of all scientific Python.
+# Think of it as: arrays + math operations that run in C-speed under the hood.
+# Every PyTorch tensor can convert to a NumPy array, and vice versa.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Number of I/Q sample pairs per file in each dataset.
+# This is a HARDWARE-LEVEL fact: the SDR (Software-Defined Radio) used by NUAA
+# was configured to capture exactly this many samples per recording.
+# Roughly 1ms of signal time, sampled at 31.25 MHz (125 MHz original rate, decimated by 4).
 FM_SAMPLES_PER_FILE = 32508
 LTE_SAMPLES_PER_FILE = 16254
 
-# 14-bit signed ADC range
+# 14-bit signed ADC range.
+# An ADC (Analog-to-Digital Converter) is the chip inside the SDR that turns
+# the analog radio voltage into integers. "14-bit signed" means each I or Q
+# value is an integer in the range [-2^13, 2^13 - 1] = [-8192, 8191].
+# This range is fixed by the hardware; the actual signal magnitudes we see
+# may fill or be much smaller than this range depending on signal strength.
 ADC_MIN = -8192
 ADC_MAX = 8191
 
 # Filename pattern: 172.19.220.14-2022-0923-HHMMSS.xls
 # Example: 172.19.220.14-2022-0923-092023.xls
+#
+# The "172.19.220.14" is the SDR's internal IP address (just metadata).
+# "2022-0923" is the date (Sept 23, 2022) — all files are from this one day.
+# "HHMMSS" is the recording timestamp; this is what we use to sort the files
+# chronologically. 092023 means 09:20:23 AM, for example.
 _FILENAME_TIMESTAMP_RE = re.compile(r'.*-(\d{6})\.xls$')
 
 
@@ -78,7 +106,10 @@ def parse_iq_file(filepath: str, expected_samples: Optional[int] = None) -> np.n
     if len(lines) < 2:
         raise ValueError(f"File {filepath} has fewer than 2 lines")
 
-    # Parse header
+    # ─── Parse header (first line) ─────────────────────────────────────────
+    # The header row contains the very first I/Q sample plus GPS metadata.
+    # This is a peculiarity of the NUAA data format: they decided to put
+    # sample[0] in the header instead of just the first data row.
     header_fields = lines[0].split('\t')
     if len(header_fields) != 6:
         raise ValueError(
@@ -94,10 +125,18 @@ def parse_iq_file(filepath: str, expected_samples: Optional[int] = None) -> np.n
             f"File {filepath}: could not parse I0/Q0 from header: {header_fields[:2]}"
         ) from e
 
-    # Parse body rows
+    # ─── Parse body rows (remaining lines) ─────────────────────────────────
+    # Each subsequent line is one I/Q pair.
     n_body = len(lines) - 1
+
+    # np.empty allocates an uninitialized array of the given size.
+    # This is FASTER than np.zeros because it skips the zero-fill step.
+    # Safe here because we immediately write into every slot below.
+    # dtype=np.int32 means 32-bit signed integers (enough headroom for 14-bit values).
     i_samples = np.empty(1 + n_body, dtype=np.int32)
     q_samples = np.empty(1 + n_body, dtype=np.int32)
+
+    # Plant the header's first sample at index 0.
     i_samples[0] = i0
     q_samples[0] = q0
 
@@ -122,7 +161,34 @@ def parse_iq_file(filepath: str, expected_samples: Optional[int] = None) -> np.n
             f"File {filepath}: got {total} samples, expected {expected_samples}"
         )
 
-    # Build complex baseband signal
+    # ─── Build complex baseband signal ─────────────────────────────────────
+    #
+    # This is the KEY operation of this whole file. Some background:
+    #
+    # A radio wave is a sinusoid that varies in both AMPLITUDE (how strong)
+    # and PHASE (where it is in its cycle). To represent this mathematically,
+    # you need TWO numbers per time instant. The radio engineering convention
+    # is to call them I (In-phase) and Q (Quadrature), which are 90° apart.
+    #
+    # The clever trick: pack (I, Q) into a single complex number Z = I + j*Q,
+    # where j is the imaginary unit (math people use 'i', engineers use 'j'
+    # to avoid clash with current). Once you do this:
+    #
+    #   - The MAGNITUDE |Z| = sqrt(I² + Q²) = the signal's instantaneous amplitude.
+    #   - The PHASE angle(Z) = atan2(Q, I) = the signal's instantaneous phase.
+    #
+    # This isn't just notation — complex multiplication does meaningful things:
+    # multiplying by exp(j*omega*t) shifts the signal in frequency. This is the
+    # mathematical basis of the FFT (Fast Fourier Transform), which we'll use
+    # next in stft.py.
+    #
+    # Why .astype(np.float64) first? Because numpy's complex multiplication
+    # operates on floats internally. Going int32 → complex128 directly would
+    # work but is less explicit. We promote to float64, which has the same
+    # bit-width as each half of complex128 (64 + 64 = 128 bits).
+    #
+    # The returned array has dtype complex128 automatically — numpy sees that
+    # one side is real, the other is imaginary, and infers the right dtype.
     return i_samples.astype(np.float64) + 1j * q_samples.astype(np.float64)
 
 
@@ -140,11 +206,15 @@ def get_file_timestamp(filepath: str) -> str:
         ValueError: if the filename doesn't match the expected pattern.
     """
     name = os.path.basename(filepath)
+    # Regex match — captures the 6 digits before .xls into group 1.
     match = _FILENAME_TIMESTAMP_RE.match(name)
     if match is None:
         raise ValueError(
             f"Filename does not match expected pattern '...HHMMSS.xls': {name}"
         )
+    # Return the timestamp as a string ('092023'), not an int.
+    # Strings sort lexicographically and HHMMSS sorts correctly that way
+    # (because all parts are zero-padded to fixed width).
     return match.group(1)
 
 
@@ -160,6 +230,13 @@ def list_files_chronological(directory: str) -> list:
     Returns:
         List of full paths, sorted by HHMMSS timestamp ascending.
     """
+    # CRITICAL: chronological sorting is essential for forecasting.
+    # If files were processed in arbitrary order (e.g., the filesystem's
+    # default order, which depends on the OS), then the train/val/test
+    # split would be temporally jumbled, and the model could effectively
+    # "cheat" by interpolating between adjacent frames in time.
+    # By sorting by HHMMSS first, the downstream code can do a clean
+    # 4:1:1 chronological split (first 67% = train, then 17% val, then 17% test).
     paths = []
     for entry in os.listdir(directory):
         if not entry.endswith('.xls'):
@@ -170,5 +247,9 @@ def list_files_chronological(directory: str) -> list:
             continue
         paths.append(os.path.join(directory, entry))
 
+    # The 'key' argument tells sort() to compare files by their HHMMSS
+    # timestamp rather than the full filename. Since all files share the
+    # same date and IP prefix, sorting by HHMMSS is equivalent to sorting
+    # by full filename in this case, but more explicit about intent.
     paths.sort(key=get_file_timestamp)
     return paths
