@@ -1,5 +1,5 @@
 """
-3D-SwinSTB training loop.
+3D-SwinSTB / Simple-CNN training loop.
 
 Implements Pan et al. Section IV-F (training rules) plus standard
 production-quality additions:
@@ -8,6 +8,14 @@ production-quality additions:
     - Early stopping (patience=4, min improvement 0.01% of best)
     - Latest + best checkpoint pattern for Colab session resumption
     - CSV training log for post-hoc analysis
+
+Supports two model types via the `model_type` argument:
+    - 'swinstb'    : the full 3D-SwinSTB reproduction (default)
+    - 'simple_cnn' : a lightweight 3D-CNN baseline for pipeline sanity checks
+
+The model type only affects (a) which class is constructed and (b) the
+output filenames, so the SwinSTB training path is byte-for-byte unchanged
+when model_type='swinstb'.
 
 What this does NOT do (intentionally):
     - LR scheduling (Pan et al. use constant lr=0.001)
@@ -18,7 +26,7 @@ What this does NOT do (intentionally):
 The trainer is designed so that a single Colab session that times out
 mid-training can resume cleanly: every epoch, both _latest.pt (always)
 and _best.pt (when val improves) are written to disk, and the CSV log
-is appended-to. Pass --resume to scripts/05_train_fm.py to continue.
+is appended-to. Pass --resume to the training script to continue.
 """
 
 import csv
@@ -34,7 +42,66 @@ from torch.utils.data import DataLoader
 
 from src.data.dataset import SpectrogramSequenceDataset
 from src.model.swinstb import SwinSTB
+from src.model.simple_cnn3d import SimpleCNN3D
 from src.utils.checkpoint import save_checkpoint, load_checkpoint
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model-type registry
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Each entry maps a model_type string to the filename prefix used for its
+# checkpoints and log. Adding a new model type means adding one entry here
+# plus a branch in _build_model below.
+_MODEL_PREFIXES = {
+    'swinstb': 'swinstb_fm',
+    'simple_cnn': 'simple_cnn_fm',
+}
+
+
+def _build_model(model_type: str, config: dict, device: str) -> nn.Module:
+    """
+    Construct the requested model and move it to `device`.
+
+    Args:
+        model_type: 'swinstb' or 'simple_cnn'.
+        config: the full config dict (model_type='swinstb' reads config['model']).
+        device: 'cuda' or 'cpu'.
+
+    Returns:
+        The constructed model, already moved to device.
+    """
+    if model_type == 'swinstb':
+        # Full 3D-SwinSTB — reads architecture hyperparameters from config.
+        model_cfg = config['model']
+        model = SwinSTB(
+            in_channels=model_cfg['in_channels'],
+            out_channels=model_cfg['out_channels'],
+            embed_dim=model_cfg['feature_size'],
+            patch_size=tuple(model_cfg['patch_size']),
+            window_size=tuple(model_cfg['window_size']),
+            encoder_depths=tuple(model_cfg['depths'][:3]),
+            encoder_heads=tuple(model_cfg['num_heads'][:3]),
+            decoder_depths=(2, 4, 2),
+            decoder_heads=(16, 8, 4),
+            bottleneck_depth=2,
+            mlp_ratio=model_cfg['mlp_ratio'],
+        ).to(device)
+    elif model_type == 'simple_cnn':
+        # Lightweight 3D-CNN baseline. No architecture hyperparameters to
+        # read — it is intentionally fixed. Just uses in/out channels,
+        # which are 3 (RGB) for this dataset.
+        model_cfg = config['model']
+        model = SimpleCNN3D(
+            in_channels=model_cfg['in_channels'],
+            out_channels=model_cfg['out_channels'],
+        ).to(device)
+    else:
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. "
+            f"Expected one of: {list(_MODEL_PREFIXES.keys())}"
+        )
+    return model
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -140,22 +207,34 @@ def validate(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train(config: dict, resume: bool = False, force_restart: bool = False,
-          smoke_test: bool = False, seed: int = 42) -> dict:
+          smoke_test: bool = False, seed: int = 42,
+          model_type: str = 'swinstb') -> dict:
     """
     Run end-to-end training as specified by `config`.
 
     Args:
-        config: nested dict from configs/default.yaml.
+        config: nested dict from a YAML config file.
         resume: if True, load checkpoint and continue. Fails if no checkpoint.
         force_restart: if True, ignore an existing _latest.pt and start fresh.
         smoke_test: if True, run 2 epochs × 10 batches each for pipeline
             verification. Real training runs the configured num_epochs.
         seed: RNG seed for torch + numpy reproducibility.
+        model_type: 'swinstb' (default) or 'simple_cnn'. Selects which model
+            class to construct and which output filenames to use. The
+            SwinSTB path is unchanged when this is 'swinstb'.
 
     Returns:
         Dict with keys: 'final_epoch', 'best_val_loss', 'best_epoch',
         'history' (list of per-epoch metric dicts).
     """
+    # Validate model_type early so a typo fails fast.
+    if model_type not in _MODEL_PREFIXES:
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. "
+            f"Expected one of: {list(_MODEL_PREFIXES.keys())}"
+        )
+    prefix = _MODEL_PREFIXES[model_type]
+
     # ─── RNG seed ────────────────────────────────────────────────────────────
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -183,9 +262,12 @@ def train(config: dict, resume: bool = False, force_restart: bool = False,
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    latest_path = os.path.join(checkpoint_dir, 'swinstb_fm_latest.pt')
-    best_path = os.path.join(checkpoint_dir, 'swinstb_fm_best.pt')
-    log_path = os.path.join(output_dir, 'training_log.csv')
+    # Output filenames are derived from the model_type prefix, so the
+    # simple-CNN run writes simple_cnn_fm_latest.pt etc. and never collides
+    # with the SwinSTB checkpoints.
+    latest_path = os.path.join(checkpoint_dir, f'{prefix}_latest.pt')
+    best_path = os.path.join(checkpoint_dir, f'{prefix}_best.pt')
+    log_path = os.path.join(output_dir, f'training_log_{model_type}.csv')
 
     # ─── Datasets and dataloaders ────────────────────────────────────────────
     seq_cfg = config['data']['sequence']
@@ -220,22 +302,10 @@ def train(config: dict, resume: bool = False, force_restart: bool = False,
     )
 
     # ─── Model, optimizer, scaler ────────────────────────────────────────────
-    model_cfg = config['model']
-    model = SwinSTB(
-        in_channels=model_cfg['in_channels'],
-        out_channels=model_cfg['out_channels'],
-        embed_dim=model_cfg['feature_size'],
-        patch_size=tuple(model_cfg['patch_size']),
-        window_size=tuple(model_cfg['window_size']),
-        encoder_depths=tuple(model_cfg['depths'][:3]),
-        encoder_heads=tuple(model_cfg['num_heads'][:3]),
-        decoder_depths=(2, 4, 2),
-        decoder_heads=(16, 8, 4),
-        bottleneck_depth=2,
-        mlp_ratio=model_cfg['mlp_ratio'],
-    ).to(device)
+    model = _build_model(model_type, config, device)
 
     n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model type:       {model_type}")
     print(f"Model parameters: {n_params:,}")
 
     optimizer = torch.optim.AdamW(
